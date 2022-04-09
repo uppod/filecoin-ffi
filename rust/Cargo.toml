@@ -74,6 +74,17 @@ opencl = ["filecoin-proofs-api/opencl", "bellperson/opencl", "storage-proofs-por
 cuda = ["filecoin-proofs-api/cuda", "bellperson/cuda", "storage-proofs-porep/cuda", "rust-gpu-tools/cuda", "fvm/cuda"]
 multicore-sdr = ["storage-proofs-porep/multicore-sdr"]
 
+[patch.crates-io]
+filecoin-proofs = { path = "../../../../rust-fil-proofs/filecoin-proofs" }
+storage-proofs-core = { path = "../../../../rust-fil-proofs/storage-proofs-core" }
+storage-proofs-porep = { path = "../../../../rust-fil-proofs/storage-proofs-porep" }
+storage-proofs-post = { path = "../../../../rust-fil-proofs/storage-proofs-post" }
+fil-proofs-tooling = { path = "../../../../rust-fil-proofs/fil-proofs-tooling" }
+fil-proofs-param = { path = "../../../../rust-fil-proofs/fil-proofs-param" }
+fr32 = { path = "../../../../rust-fil-proofs/fr32" }
+sha2raw = { path = "../../../../rust-fil-proofs/sha2raw" }
+filecoin-hashers = { path = "../../../../rust-fil-proofs/filecoin-hashers" }
+
 # Only enabled by cbindgen. When enabled, the cgo_* externs are disabled so as not to confuse
 # cbindgen.
 bindgen=[]
