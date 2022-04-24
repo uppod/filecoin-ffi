@@ -52,6 +52,10 @@ pub struct fil_FvmMachineExecuteResponse {
     pub penalty_lo: u64,
     pub miner_tip_hi: u64,
     pub miner_tip_lo: u64,
+    pub exec_trace_ptr: *const u8,
+    pub exec_trace_len: libc::size_t,
+    pub failure_info_ptr: *const u8,
+    pub failure_info_len: libc::size_t,
 }
 
 impl Default for fil_FvmMachineExecuteResponse {
@@ -59,7 +63,7 @@ impl Default for fil_FvmMachineExecuteResponse {
         fil_FvmMachineExecuteResponse {
             error_msg: ptr::null(),
             status_code: FCPResponseStatus::FCPNoError,
-            exit_code: ExitCode::Ok as u64,
+            exit_code: ExitCode::OK.value() as u64,
             return_ptr: ptr::null(),
             return_len: 0,
             gas_used: 0,
@@ -67,6 +71,10 @@ impl Default for fil_FvmMachineExecuteResponse {
             penalty_lo: 0,
             miner_tip_hi: 0,
             miner_tip_lo: 0,
+            exec_trace_ptr: ptr::null(),
+            exec_trace_len: 0,
+            failure_info_ptr: ptr::null(),
+            failure_info_len: 0,
         }
     }
 }

@@ -1,15 +1,19 @@
 use std::convert::{TryFrom, TryInto};
 use std::sync::Mutex;
 
+use anyhow::anyhow;
 use cid::Cid;
 use ffi_toolkit::{catch_panic_response, raw_ptr, rust_str_to_c_str, FCPResponseStatus};
 use futures::executor::block_on;
-use fvm::call_manager::DefaultCallManager;
+use fvm::call_manager::{DefaultCallManager, InvocationResult};
 use fvm::executor::{ApplyKind, DefaultExecutor, Executor};
 use fvm::machine::DefaultMachine;
-use fvm::{Config, DefaultKernel};
+use fvm::trace::ExecutionEvent;
+use fvm::DefaultKernel;
 use fvm_ipld_blockstore::Blockstore;
 use fvm_ipld_car::load_car;
+use fvm_ipld_encoding::tuple::{Deserialize_tuple, Serialize_tuple};
+use fvm_shared::receipt::Receipt;
 use fvm_shared::{clock::ChainEpoch, econ::TokenAmount, message::Message, version::NetworkVersion};
 use lazy_static::lazy_static;
 use log::info;
@@ -18,6 +22,9 @@ use super::blockstore::{CgoBlockstore, FakeBlockstore, OverlayBlockstore};
 use super::externs::CgoExterns;
 use super::types::*;
 use crate::util::api::init_log;
+use fvm_ipld_encoding::{to_vec, RawBytes};
+use fvm_shared::address::Address;
+use fvm_shared::error::{ErrorNumber, ExitCode};
 
 pub type CgoExecutor = DefaultExecutor<
     DefaultKernel<DefaultCallManager<DefaultMachine<OverlayBlockstore<CgoBlockstore>, CgoExterns>>>,
@@ -45,9 +52,12 @@ pub unsafe extern "C" fn fil_create_fvm_machine(
     state_root_len: libc::size_t,
     manifest_cid_ptr: *const u8,
     manifest_cid_len: libc::size_t,
+    tracing: bool,
     blockstore_id: u64,
     externs_id: u64,
 ) -> *mut fil_CreateFvmMachineResponse {
+    use fvm::machine::NetworkConfig;
+
     catch_panic_response(|| {
         init_log();
 
@@ -59,7 +69,6 @@ pub unsafe extern "C" fn fil_create_fvm_machine(
             //_ => panic!("unsupported FVM Registered Version")
         }
 
-        let config = Config::default();
         let chain_epoch = chain_epoch as ChainEpoch;
 
         let base_circ_supply = TokenAmount::from(
@@ -112,31 +121,34 @@ pub unsafe extern "C" fn fil_create_fvm_machine(
 
         let blockstore = FakeBlockstore::new(CgoBlockstore::new(blockstore_id));
 
-        let builtin_actors = match import_actors(&blockstore, manifest_cid, network_version) {
-            Ok(x) => x,
+        let mut network_config = NetworkConfig::new(network_version);
+        match import_actors(&blockstore, manifest_cid, network_version) {
+            Ok(Some(manifest)) => {
+                network_config.override_actors(manifest);
+            }
+            Ok(None) => {}
             Err(err) => {
                 response.status_code = FCPResponseStatus::FCPUnclassifiedError;
                 response.error_msg =
                     rust_str_to_c_str(format!("couldn't load builtin actors: {}", err));
                 return raw_ptr(response);
             }
-        };
+        }
 
+        let mut machine_context = network_config.for_epoch(chain_epoch, state_root);
+
+        machine_context
+            .set_base_fee(base_fee)
+            .set_circulating_supply(base_circ_supply);
+
+        if tracing {
+            machine_context.enable_tracing();
+        }
         let blockstore = blockstore.finish();
 
         let externs = CgoExterns::new(externs_id);
-        let machine = fvm::machine::DefaultMachine::new(
-            config,
-            ENGINE.clone(),
-            chain_epoch,
-            base_fee,
-            base_circ_supply,
-            network_version,
-            state_root,
-            builtin_actors,
-            blockstore,
-            externs,
-        );
+        let machine =
+            fvm::machine::DefaultMachine::new(&ENGINE, &machine_context, blockstore, externs);
         match machine {
             Ok(machine) => {
                 response.status_code = FCPResponseStatus::FCPNoError;
@@ -205,6 +217,29 @@ pub unsafe extern "C" fn fil_fvm_machine_execute_message(
             }
         };
 
+        if !apply_ret.exec_trace.is_empty() {
+            let mut trace_iter = apply_ret.exec_trace.into_iter();
+            if let Ok(Ok(lotus_t_bytes)) = build_lotus_trace(
+                &trace_iter
+                    .next()
+                    .expect("already checked trace for emptiness"),
+                &mut trace_iter,
+            )
+            .map(|lotus_trace| to_vec(&lotus_trace).map(|v| v.into_boxed_slice()))
+            {
+                response.exec_trace_ptr = lotus_t_bytes.as_ptr();
+                response.exec_trace_len = lotus_t_bytes.len();
+                Box::leak(lotus_t_bytes);
+            }
+        }
+
+        if let Some(info) = apply_ret.failure_info {
+            let info_bytes = info.to_string().into_boxed_str().into_boxed_bytes();
+            response.failure_info_ptr = info_bytes.as_ptr();
+            response.failure_info_len = info_bytes.len();
+            Box::leak(info_bytes);
+        }
+
         // TODO: use the non-bigint token amount everywhere in the FVM
         let penalty: u128 = apply_ret.penalty.try_into().unwrap();
         let miner_tip: u128 = apply_ret.miner_tip.try_into().unwrap();
@@ -220,7 +255,7 @@ pub unsafe extern "C" fn fil_fvm_machine_execute_message(
 
         // TODO: Do something with the backtrace.
         response.status_code = FCPResponseStatus::FCPNoError;
-        response.exit_code = apply_ret.msg_receipt.exit_code as u64;
+        response.exit_code = apply_ret.msg_receipt.exit_code.value() as u64;
         response.gas_used = apply_ret.msg_receipt.gas_used as u64;
         response.penalty_hi = (penalty >> u64::BITS) as u64;
         response.penalty_lo = penalty as u64;
@@ -304,4 +339,149 @@ fn import_actors(
     let roots = block_on(async { load_car(blockstore, car).await.unwrap() });
     assert_eq!(roots.len(), 1);
     Ok(Some(roots[0]))
+}
+
+#[derive(Clone, Debug, Serialize_tuple, Deserialize_tuple)]
+struct LotusTrace {
+    pub msg: Message,
+    pub msg_receipt: Receipt,
+    pub error: String,
+    pub subcalls: Vec<LotusTrace>,
+}
+
+fn build_lotus_trace(
+    new_call: &ExecutionEvent,
+    trace_iter: &mut impl Iterator<Item = ExecutionEvent>,
+) -> anyhow::Result<LotusTrace> {
+    let mut new_trace = LotusTrace {
+        msg: match new_call {
+            ExecutionEvent::Call(send_params) => Message {
+                version: 0,
+                from: Address::new_id(send_params.from),
+                to: send_params.to,
+                sequence: 0,
+                value: send_params.value.clone(),
+                method_num: send_params.method,
+                params: send_params.params.clone(),
+                gas_limit: 0,
+                gas_fee_cap: TokenAmount::default(),
+                gas_premium: TokenAmount::default(),
+            },
+            _ => {
+                return Err(anyhow!("expected ExecutionEvent of type Call"));
+            }
+        },
+        msg_receipt: Receipt {
+            exit_code: ExitCode::OK,
+            return_data: RawBytes::default(),
+            gas_used: 0,
+        },
+        error: String::new(),
+        subcalls: vec![],
+    };
+
+    while let Some(trace) = trace_iter.next() {
+        match trace {
+            ExecutionEvent::Return(res) => {
+                new_trace.msg_receipt = match res {
+                    Ok(InvocationResult::Return(return_data)) => Receipt {
+                        exit_code: ExitCode::OK,
+                        return_data,
+                        gas_used: 0,
+                    },
+                    Ok(InvocationResult::Failure(exit_code)) => {
+                        if exit_code.is_success() {
+                            return Err(anyhow!("actor failed with status OK"));
+                        }
+                        Receipt {
+                            exit_code,
+                            return_data: Default::default(),
+                            gas_used: 0,
+                        }
+                    }
+                    Err(syscall_err) => {
+                        // Errors indicate the message couldn't be dispatched at all
+                        // (as opposed to failing during execution of the receiving actor).
+                        // These errors are mapped to exit codes that persist on chain.
+                        let exit_code = match syscall_err.1 {
+                            ErrorNumber::InsufficientFunds => ExitCode::SYS_INSUFFICIENT_FUNDS,
+                            ErrorNumber::NotFound => ExitCode::SYS_INVALID_RECEIVER,
+
+                            ErrorNumber::IllegalArgument => ExitCode::SYS_ASSERTION_FAILED,
+                            ErrorNumber::IllegalOperation => ExitCode::SYS_ASSERTION_FAILED,
+                            ErrorNumber::LimitExceeded => ExitCode::SYS_ASSERTION_FAILED,
+                            ErrorNumber::AssertionFailed => ExitCode::SYS_ASSERTION_FAILED,
+                            ErrorNumber::InvalidHandle => ExitCode::SYS_ASSERTION_FAILED,
+                            ErrorNumber::IllegalCid => ExitCode::SYS_ASSERTION_FAILED,
+                            ErrorNumber::IllegalCodec => ExitCode::SYS_ASSERTION_FAILED,
+                            ErrorNumber::Serialization => ExitCode::SYS_ASSERTION_FAILED,
+                            ErrorNumber::Forbidden => ExitCode::SYS_ASSERTION_FAILED,
+                        };
+
+                        Receipt {
+                            exit_code,
+                            return_data: Default::default(),
+                            gas_used: 0,
+                        }
+                    }
+                };
+
+                return Ok(new_trace);
+            }
+
+            _ => {
+                new_trace
+                    .subcalls
+                    .push(build_lotus_trace(&trace, trace_iter)?);
+            }
+        };
+    }
+
+    Err(anyhow!("should have returned on an ExecutionEvent:Return"))
+}
+
+#[cfg(test)]
+mod test {
+    use crate::fvm::machine::build_lotus_trace;
+    use fvm::kernel::SyscallError;
+    use fvm::trace::{ExecutionEvent, SendParams};
+    use fvm_ipld_encoding::RawBytes;
+    use fvm_shared::address::Address;
+    use fvm_shared::econ::TokenAmount;
+    use fvm_shared::error::ErrorNumber::IllegalArgument;
+    use fvm_shared::ActorID;
+
+    #[test]
+    fn test_lotus_trace() {
+        let call_event = ExecutionEvent::Call(SendParams {
+            from: ActorID::default(),
+            method: 0,
+            params: RawBytes::default(),
+            to: Address::new_id(0),
+            value: TokenAmount::default(),
+        });
+        let return_result =
+            ExecutionEvent::Return(Err(SyscallError::new(IllegalArgument, "illegal")));
+        let trace = vec![
+            call_event.clone(),
+            call_event.clone(),
+            return_result.clone(),
+            call_event.clone(),
+            call_event,
+            return_result.clone(),
+            return_result.clone(),
+            return_result,
+        ];
+
+        let mut trace_iter = trace.into_iter();
+
+        let lotus_trace = build_lotus_trace(&trace_iter.next().unwrap(), &mut trace_iter).unwrap();
+
+        assert!(trace_iter.next().is_none());
+
+        assert_eq!(lotus_trace.subcalls.len(), 2);
+        assert_eq!(lotus_trace.subcalls[0].subcalls.len(), 0);
+        assert_eq!(lotus_trace.subcalls[1].subcalls.len(), 1);
+        assert_eq!(lotus_trace.subcalls[1].subcalls[0].subcalls.len(), 0);
+    }
 }
